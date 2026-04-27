@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEURAL_STRING_OS // 3D DSP EDITION</title>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+
+    <style>
+        body { margin: 0; background: #020205; overflow: hidden; color: #00ffcc; font-family: 'Space Mono', monospace; cursor: crosshair; }
+        #ui { position: absolute; top: 20px; left: 20px; z-index: 100; pointer-events: none; text-transform: uppercase; letter-spacing: 2px; }
+        #instructions { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 100; background: rgba(0,255,204,0.1); padding: 10px 20px; border: 1px solid #00ffcc; backdrop-filter: blur(5px); transition: opacity 0.5s; }
+        canvas { display: block; filter: contrast(1.1) brightness(1.1); }
+        .crt-line { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.2) 50%); background-size: 100% 3px; pointer-events: none; z-index: 200; opacity: 0.3; }
+        #audio-prompt { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center; z-index: 1000; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <div id="audio-prompt"><h1>[ CLICK TO INITIALIZE SIGNAL ]</h1></div>
+
+    <div id="ui">
+        <div>System: Neural_Cradle_v2.0</div>
+        <div id="tracking-status">Status: Waiting for Input...</div>
+        <div id="osc-data">Frequency: 0Hz</div>
+    </div>
+
+    <div id="instructions">Align both hands to calibrate the strings</div>
+    <div class="crt-line"></div>
+
+    <script>
+        /** * AUDIO ENGINE: Web Audio API DSP 
+         */
+        let audioCtx;
+        const voices = [];
+        const numStrings = 5;
+
+        function initAudio() {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const masterGain = audioCtx.createGain();
+            masterGain.connect(audioCtx.destination);
+            masterGain.gain.value = 0.2;
+
+            for (let i = 0; i < numStrings; i++) {
+                const osc = audioCtx.createOscillator();
+                const filter = audioCtx.createBiquadFilter();
+                const gain = audioCtx.createGain();
+
+                osc.type = 'sawtooth';
+                filter.type = 'lowpass';
+                gain.gain.value = 0;
+
+                osc.connect(filter);
+                filter.connect(gain);
+                gain.connect(masterGain);
+                
+                osc.start();
+                voices.push({ osc, filter, gain });
+            }
+        }
+
+        /**
+         * 3D SCENE SETUP
+         */
+        const scene = new THREE.Scene();
+        const camera3D = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        camera3D.position.z = 5;
+
+        // Geometry for Strings
+        const stringLines = [];
+        const stringMaterials = [];
+        const fingerIndices = [4, 8, 12, 16, 20]; // Thumb to Pinky
+
+        for (let i = 0; i < numStrings; i++) {
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(6); // 2 points * 3 coords
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            
+            const material = new THREE.LineBasicMaterial({ 
+                color: new THREE.Color().setHSL(i / numStrings, 1.0, 0.5),
+                transparent: true,
+                opacity: 0.8,
+                linewidth: 2
+            });
+
+            const line = new THREE.Line(geometry, material);
+            scene.add(line);
+            stringLines.push(line);
+            stringMaterials.push(material);
+        }
+
+        // Hand Joint Visualization
+        const jointGeometry = new THREE.SphereGeometry(0.04, 8, 8);
+        const jointsLeft = [];
+        const jointsRight = [];
+
+        for (let i = 0; i < 21; i++) {
+            const m1 = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
+            const s1 = new THREE.Mesh(jointGeometry, m1);
+            scene.add(s1);
+            jointsLeft.push(s1);
+
+            const m2 = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+            const s2 = new THREE.Mesh(jointGeometry, m2);
+            scene.add(s2);
+            jointsRight.push(s2);
+        }
+
+        /**
+         * MEDIAPIPIE TRACKING
+         */
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.8,
+            minTrackingConfidence: 0.8
+        });
+
+        hands.onResults(onResults);
+
+        const videoElement = document.createElement('video');
+        const camera = new Camera(videoElement, {
+            onFrame: async () => await hands.send({ image: videoElement }),
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+
+        function onResults(results) {
+            if (!results.multiHandLandmarks) return;
+
+            document.getElementById('tracking-status').innerText = `Status: Tracking ${results.multiHandLandmarks.length} Hands`;
+            
+            let leftHand = null;
+            let rightHand = null;
+
+            results.multiHandLandmarks.forEach((landmarks, index) => {
+                const isRight = results.multiHandedness[index].label === 'Right';
+                const joints = isRight ? jointsRight : jointsLeft;
+                
+                if (isRight) rightHand = landmarks;
+                else leftHand = landmarks;
+
+                landmarks.forEach((lm, i) => {
+                    // Map 0-1 to 3D Space
+                    joints[i].position.x = (lm.x - 0.5) * -10; 
+                    joints[i].position.y = (lm.y - 0.5) * -6;
+                    joints[i].position.z = lm.z * -10;
+                    joints[i].visible = true;
+                });
+            });
+
+            // Update Strings and Audio
+            if (leftHand && rightHand) {
+                document.getElementById('instructions').style.opacity = 0;
+                
+                fingerIndices.forEach((fIdx, i) => {
+                    const lPos = jointsLeft[fIdx].position;
+                    const rPos = jointsRight[fIdx].position;
+
+                    // Update Line Geometry
+                    const positions = stringLines[i].geometry.attributes.position.array;
+                    positions[0] = lPos.x; positions[1] = lPos.y; positions[2] = lPos.z;
+                    positions[3] = rPos.x; positions[4] = rPos.y; positions[5] = rPos.z;
+                    stringLines[i].geometry.attributes.position.needsUpdate = true;
+                    stringLines[i].visible = true;
+
+                    // DSP Logic
+                    if (audioCtx) {
+                        const dist = lPos.distanceTo(rPos);
+                        const avgY = (lPos.y + rPos.y) / 2;
+                        
+                        // Map Y position to Frequency (Harmonic Scale)
+                        const freq = 110 * Math.pow(2, (avgY + 3) / 1.5);
+                        voices[i].osc.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.05);
+                        
+                        // Map distance to Filter Cutoff (Intensity)
+                        const cutoff = Math.min(20000, Math.max(200, dist * 1500));
+                        voices[i].filter.frequency.setTargetAtTime(cutoff, audioCtx.currentTime, 0.05);
+                        
+                        // Set Volume
+                        voices[i].gain.gain.setTargetAtTime(0.15, audioCtx.currentTime, 0.1);
+                        
+                        if (i === 0) document.getElementById('osc-data').innerText = `Frequency: ${Math.round(freq)}Hz`;
+                    }
+                });
+            } else {
+                // Kill audio if hands lost
+                voices.forEach(v => v.gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1));
+                stringLines.forEach(l => l.visible = false);
+            }
+        }
+
+        /**
+         * RENDER LOOP
+         */
+        function animate() {
+            requestAnimationFrame(animate);
+            // Subtle scene rotation based on time for depth
+            scene.rotation.y = Math.sin(Date.now() * 0.0005) * 0.1;
+            renderer.render(scene, camera3D);
+        }
+        animate();
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera3D.aspect = window.innerWidth / window.innerHeight;
+            camera3D.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Initialize Audio on Click
+        document.getElementById('audio-prompt').addEventListener('click', () => {
+            initAudio();
+            document.getElementById('audio-prompt').style.display = 'none';
+        });
+    </script>
+</body>
+</html>
